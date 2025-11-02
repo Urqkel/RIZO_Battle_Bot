@@ -29,7 +29,7 @@ import pytesseract
 
 # ---------- Config ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")  # e.g. https://pfp-battle-bot.onrender.com
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")  # e.g. https://RIZO-battle-bot.onrender.com
 PORT = int(os.getenv("PORT", 10000))
 
 if not BOT_TOKEN:
