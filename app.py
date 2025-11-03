@@ -1,20 +1,14 @@
 import os
 import io
 import re
-import uuid
-import json
-import sqlite3
-import logging
 import random
-from datetime import datetime
-from typing import Optional
-
+import asyncio
+import logging
+import httpx
+from datetime import datetime, timedelta
+from PIL import Image
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
+from telegram import Update, InputFile
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -23,284 +17,219 @@ from telegram.ext import (
     filters,
 )
 
-from PIL import Image
-import pytesseract
-
-# ===================== CONFIG =====================
+# ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://rizo-battle-bot.onrender.com
 PORT = int(os.getenv("PORT", 10000))
+BATTLE_COOLDOWN = int(os.getenv("BATTLE_COOLDOWN", 60))  # seconds
 
-if not BOT_TOKEN:
-    raise RuntimeError("❌ BOT_TOKEN not set in environment.")
-if not RENDER_EXTERNAL_URL:
-    raise RuntimeError("❌ RENDER_EXTERNAL_URL not set in environment.")
+# ---------------- LOGGING ----------------
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("rizo-battle-bot")
 
-WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
-WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
+# ---------------- TELEGRAM APP ----------------
+application = Application.builder().token(BOT_TOKEN).build()
 
-# ===================== LOGGING =====================
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("rizo-battle-bot")
+# ---------------- FASTAPI APP ----------------
+fastapi_app = FastAPI(title="Rizo Battle Bot")
 
-# ===================== FASTAPI =====================
-app = FastAPI(title="Rizo Battle Bot", version="1.0")
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
+# ---------------- STATE ----------------
+user_last_battle = {}  # user_id -> datetime of last battle
 
-# ===================== DATABASE =====================
-DB_PATH = "battles.db"
-os.makedirs("battles", exist_ok=True)
-os.makedirs("cards", exist_ok=True)
+# ------------------------------------------------
+#                 HELPERS
+# ------------------------------------------------
+def within_cooldown(user_id: int) -> bool:
+    """Check if user is within cooldown window."""
+    now = datetime.utcnow()
+    last_time = user_last_battle.get(user_id)
+    if not last_time:
+        return False
+    return (now - last_time).total_seconds() < BATTLE_COOLDOWN
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS battles (
-            id TEXT PRIMARY KEY,
-            timestamp TEXT,
-            challenger_username TEXT,
-            challenger_stats TEXT,
-            opponent_username TEXT,
-            opponent_stats TEXT,
-            winner TEXT,
-            html_path TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+async def download_file(url: str) -> io.BytesIO:
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return io.BytesIO(resp.content)
 
-init_db()
-
-# ===================== RUNTIME =====================
-pending_challenges: dict[int, str] = {}
-uploaded_cards: dict[int, dict] = {}
-
-# ===================== OCR =====================
-def ocr_text_from_bytes(file_bytes: bytes) -> str:
-    try:
-        image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-        text = pytesseract.image_to_string(image)
-        return text
-    except Exception as e:
-        log.error(f"OCR failed: {e}")
-        return ""
-
-def parse_stats_from_text(text: str) -> dict:
-    lower = text.lower()
-
-    hp = int(re.search(r"hp[:\s]*([0-9]{1,4})", lower).group(1)) if re.search(r"hp[:\s]*([0-9]{1,4})", lower) else 100
-    defense = int(re.search(r"defen(?:se|c)e?[:\s]*([0-9]{1,4})", lower).group(1)) if re.search(r"defen(?:se|c)e?[:\s]*([0-9]{1,4})", lower) else 50
-    serial = int(re.search(r"#\s*([0-9]{1,4})", lower).group(1)) if re.search(r"#\s*([0-9]{1,4})", lower) else 1000
-
-    attack_patterns = re.findall(r"([a-z\s]+)\s*[:\-]?\s*([0-9]{1,4})", text, re.IGNORECASE)
-    attacks = []
-    for name, val in attack_patterns:
-        name = name.strip().title()
-        if any(k in name.lower() for k in ["attack", "strike", "blast", "move", "punch", "kick"]):
-            attacks.append((name, int(val)))
-
-    if not attacks:
-        attacks = [("Basic Strike", 30), ("Heavy Blow", 40)]
-    elif len(attacks) == 1:
-        attacks.append(("Heavy Blow", attacks[0][1] + 10))
-    else:
-        attacks = attacks[:2]
-
-    return {
-        "hp": hp,
-        "defense": defense,
-        "serial": serial,
-        "attack1_name": attacks[0][0],
-        "attack1_power": attacks[0][1],
-        "attack2_name": attacks[1][0],
-        "attack2_power": attacks[1][1],
+async def extract_stats_from_card(image_bytes: io.BytesIO) -> dict:
+    """Fake OCR/stat extraction - placeholder for real logic."""
+    # In a real bot, this would run OCR or metadata parsing
+    # For now, randomly generate stats for testing
+    stats = {
+        "power": random.randint(50, 150),
+        "defense": random.randint(50, 150),
+        "speed": random.randint(50, 150),
     }
+    logger.info(f"Extracted stats: {stats}")
+    return stats
 
-# ===================== BATTLE =====================
-def calculate_hp(card: dict) -> int:
-    serial_bonus = (2000 - card["serial"]) // 50
-    return max(1, card["hp"] + serial_bonus)
+def determine_winner(stats1: dict, stats2: dict) -> str:
+    """Simple sum-based winner logic."""
+    total1 = sum(stats1.values())
+    total2 = sum(stats2.values())
+    if total1 > total2:
+        return "player1"
+    elif total2 > total1:
+        return "player2"
+    else:
+        return "draw"
 
-ELEMENTAL_MODIFIERS = {
-    "fire": {"water": 0.5, "earth": 1.2},
-    "water": {"fire": 1.5, "earth": 1.0},
-    "earth": {"fire": 0.8, "water": 1.2},
-}
+async def generate_battle_image(user1, user2, stats1, stats2, winner):
+    """Placeholder for a generated battle card result."""
+    # Could generate OpenAI image here - for now return a mock image
+    img = Image.new("RGB", (512, 256), (30, 30, 40))
+    img_bytes = io.BytesIO()
+    img.save(img_bytes, format="PNG")
+    img_bytes.seek(0)
+    return img_bytes
 
-def get_element(move_name: str) -> str:
-    name = move_name.lower()
-    if "fire" in name:
-        return "fire"
-    if "water" in name:
-        return "water"
-    if "earth" in name:
-        return "earth"
-    return "normal"
+# ------------------------------------------------
+#                 COMMANDS
+# ------------------------------------------------
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🥊🥊! The bot is alive.")
 
-def simulate_battle(card1: dict, card2: dict):
-    hp1, hp2 = calculate_hp(card1), calculate_hp(card2)
-    def1, def2 = card1["defense"], card2["defense"]
-    log_lines = []
-    turn = 0
-
-    while hp1 > 0 and hp2 > 0:
-        turn += 1
-        attacker, defender = (card1, card2) if turn % 2 else (card2, card1)
-        move_name, move_power = random.choice([
-            (attacker["attack1_name"], attacker["attack1_power"]),
-            (attacker["attack2_name"], attacker["attack2_power"]),
-        ])
-        elem1, elem2 = get_element(move_name), get_element(defender["attack1_name"])
-        modifier = ELEMENTAL_MODIFIERS.get(elem1, {}).get(elem2, 1.0)
-        dmg = int(move_power * random.uniform(0.8, 1.2) * modifier) - int(defender["defense"] * 0.1)
-        dmg = max(5, dmg)
-
-        if turn % 2:
-            hp2 -= dmg
-        else:
-            hp1 -= dmg
-
-        log_lines.append(f"{attacker['username']} used {move_name}! ({dmg} dmg)")
-
-    winner = card1["username"] if hp1 > hp2 else card2["username"]
-    return {"winner": winner, "hp1_end": max(0, hp1), "hp2_end": max(0, hp2), "log": log_lines}
-
-# ===================== SAVE BATTLE =====================
-def save_battle_html(battle_id: str, context: dict):
-    html_path = f"battles/{battle_id}.html"
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(f"""
-        <html><body style="background:#0d0d0d;color:white;text-align:center;font-family:sans-serif;">
-        <h1>Battle #{battle_id[:8]}</h1>
-        <p>Winner: {context['winner_name']}</p>
-        <p>{context['hp1_end']} vs {context['hp2_end']}</p>
-        </body></html>
-        """)
-    return html_path
-
-def persist_battle(battle_id, c_user, c_stats, o_user, o_stats, winner, html_path):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO battles VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (battle_id, datetime.utcnow().isoformat(), c_user, json.dumps(c_stats), o_user, json.dumps(o_stats), winner, html_path)
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "⚔️ *Rizo Battle Bot Commands*\n\n"
+        "/battle - Upload two battle cards to start a match\n"
+        "/ping - Check if bot is alive\n"
+        "/help - Show this message\n"
     )
-    conn.commit()
-    conn.close()
-
-# ===================== TELEGRAM =====================
-telegram_app: Optional[Application] = None
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def cmd_battle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⚔️ *Rizo Battle Bot*\n\n"
-        "Use /challenge @username to challenge someone.\n"
-        "Then both upload your Rizo battle cards.",
-        parse_mode="Markdown"
+        "⚔️ Send me *two card images* to start a battle!\n"
+        "You can also reply to another user's card image with `/battle` to challenge them.",
+        parse_mode="Markdown",
     )
 
-async def cmd_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args or not context.args[0].startswith("@"):
-        return await update.message.reply_text("Usage: /challenge @username")
+# ------------------------------------------------
+#                 IMAGE HANDLER
+# ------------------------------------------------
+@application.add_handler
+class ImageBattleHandler(MessageHandler):
+    def __init__(self):
+        super().__init__(filters.PHOTO | filters.Document.IMAGE, self.process_image)
 
-    challenger = update.effective_user
-    opponent_username = context.args[0].lstrip("@").lower()
-    pending_challenges[challenger.id] = opponent_username
-    await update.message.reply_text(
-        f"⚔️ @{challenger.username} challenged @{opponent_username}! Upload your cards."
-    )
+    async def process_image(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        username = update.effective_user.username or user_id
 
-async def handler_card_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    username = (user.username or f"user{user.id}").lower()
+        if within_cooldown(user_id):
+            remaining = BATTLE_COOLDOWN - int((datetime.utcnow() - user_last_battle[user_id]).total_seconds())
+            await update.message.reply_text(f"⏳ Please wait {remaining}s before another battle.")
+            return
 
-    file = None
-    if update.message.photo:
-        file = await update.message.photo[-1].get_file()
-    elif update.message.document:
-        file = await update.message.document.get_file()
-    else:
-        return await update.message.reply_text("Please upload an image file.")
+        user_last_battle[user_id] = datetime.utcnow()
 
-    data = await file.download_as_bytearray()
-    ocr_text = ocr_text_from_bytes(data)
-    stats = parse_stats_from_text(ocr_text)
-    card = {"username": username, "user_id": user.id, **stats}
-    uploaded_cards[user.id] = card
+        # Download image
+        try:
+            if update.message.photo:
+                file = await update.message.photo[-1].get_file()
+            else:
+                file = await update.message.document.get_file()
 
-    await update.message.reply_text(f"✅ @{username} card received.")
+            img_bytes = await download_file(file.file_path)
+            stats = await extract_stats_from_card(img_bytes)
+        except Exception as e:
+            logger.error(f"Failed to process image: {e}")
+            await update.message.reply_text("❌ Failed to process your card. Try again.")
+            return
 
-    # try match
-    opponent_id = None
-    for challenger_id, opp_user in pending_challenges.items():
-        if opp_user == username and challenger_id in uploaded_cards:
-            opponent_id = challenger_id
-            break
-        if challenger_id == user.id:
-            opp_id = next((uid for uid, c in uploaded_cards.items() if c["username"] == opp_user), None)
-            if opp_id:
-                opponent_id = opp_id
-                break
+        # Save card info temporarily
+        context.user_data["last_card"] = {"user": username, "stats": stats, "img": img_bytes}
 
-    if opponent_id:
-        card1 = uploaded_cards[opponent_id]
-        card2 = uploaded_cards[user.id]
-        result = simulate_battle(card1, card2)
-        battle_id = str(uuid.uuid4())
-        html_path = save_battle_html(battle_id, {
-            "winner_name": result["winner"],
-            "hp1_end": result["hp1_end"],
-            "hp2_end": result["hp2_end"],
-        })
-        persist_battle(battle_id, card1["username"], card1, card2["username"], card2, result["winner"], html_path)
+        # Check if opponent already uploaded
+        if "waiting_card" not in context.chat_data:
+            context.chat_data["waiting_card"] = context.user_data["last_card"]
+            await update.message.reply_text(f"🃏 Card from @{username} locked in. Waiting for an opponent...")
+            return
 
-        replay_url = f"{RENDER_EXTERNAL_URL}/battle/{battle_id}"
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🎬 View Replay", url=replay_url)]])
-        await update.message.reply_text(
-            f"🏆 Winner: @{result['winner']}\n"
-            f"{card1['username']} HP: {result['hp1_end']} vs {card2['username']} HP: {result['hp2_end']}",
-            reply_markup=keyboard
-        )
+        # Run battle
+        opponent = context.chat_data.pop("waiting_card")
+        player1 = opponent["user"]
+        player2 = username
+        stats1 = opponent["stats"]
+        stats2 = stats
+        winner = determine_winner(stats1, stats2)
 
-# ===================== FASTAPI ROUTES =====================
-@app.get("/")
+        logger.info(f"Battle between {player1} vs {player2} => Winner: {winner}")
+
+        # Generate result image
+        battle_img = await generate_battle_image(player1, player2, stats1, stats2, winner)
+
+        caption = f"⚔️ *Battle Result*\n\n@{player1}: {stats1}\n@{player2}: {stats2}\n\n"
+        if winner == "draw":
+            caption += "🤝 It's a draw!"
+        elif winner == "player1":
+            caption += f"🏆 Winner: @{player1}"
+        else:
+            caption += f"🏆 Winner: @{player2}"
+
+        await update.message.reply_photo(InputFile(battle_img, filename="battle.png"), caption=caption, parse_mode="Markdown")
+
+# ------------------------------------------------
+#                 FASTAPI ROUTES
+# ------------------------------------------------
+@fastapi_app.get("/")
 async def root():
-    return {"status": "ok", "bot": "rizo-battle-bot"}
+    return {"status": "ok", "message": "Rizo Battle Bot is running"}
 
-@app.get("/battle/{battle_id}", response_class=HTMLResponse)
-async def get_battle(battle_id: str):
-    path = f"battles/{battle_id}.html"
-    if os.path.exists(path):
-        return FileResponse(path)
-    return HTMLResponse("<h1>Battle not found.</h1>")
+@fastapi_app.get("/healthz")
+async def healthz():
+    return {"ok": True}
 
-@app.post(WEBHOOK_PATH)
-async def telegram_webhook(req: Request):
-    update = Update.de_json(await req.json(), telegram_app.bot)
-    await telegram_app.process_update(update)
-    return JSONResponse({"ok": True})
+@fastapi_app.post("/webhook/{token}")
+async def telegram_webhook(request: Request, token: str):
+    if token != BOT_TOKEN:
+        logger.warning("Invalid webhook token access attempt")
+        return {"ok": False, "error": "invalid token"}
 
-# ===================== STARTUP / SHUTDOWN =====================
-@app.on_event("startup")
+    try:
+        update_data = await request.json()
+        update = Update.de_json(update_data, application.bot)
+        await application.update_queue.put(update)
+        return {"ok": True}
+    except Exception as e:
+        logger.exception(f"Webhook error: {e}")
+        return {"ok": False, "error": str(e)}
+
+@fastapi_app.get("/webhook/{token}")
+async def webhook_alive(token: str):
+    return {"ok": True, "message": "Webhook alive", "token": token}
+
+# ------------------------------------------------
+#                 STARTUP / SHUTDOWN
+# ------------------------------------------------
+@fastapi_app.on_event("startup")
 async def on_startup():
-    global telegram_app
-    log.info("🚀 Starting Telegram bot...")
-    telegram_app = Application.builder().token(BOT_TOKEN).build()
-    telegram_app.add_handler(CommandHandler("battle", cmd_battle))
-    telegram_app.add_handler(CommandHandler("challenge", cmd_challenge))
-    telegram_app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handler_card_upload))
-    await telegram_app.initialize()
-    await telegram_app.start()
-    await telegram_app.bot.delete_webhook(drop_pending_updates=True)
-    await telegram_app.bot.set_webhook(WEBHOOK_URL)
-    log.info(f"✅ Webhook set to {WEBHOOK_URL}")
+    await application.initialize()
+    webhook_url = f"{WEBHOOK_URL}/webhook/{BOT_TOKEN}"
+    try:
+        await application.bot.set_webhook(url=webhook_url)
+        logger.info(f"✅ Webhook set to {webhook_url}")
+    except Exception as e:
+        logger.error(f"❌ Webhook setup failed: {e}")
 
-@app.on_event("shutdown")
+    asyncio.create_task(application.start())
+
+@fastapi_app.on_event("shutdown")
 async def on_shutdown():
-    if telegram_app:
-        await telegram_app.bot.delete_webhook()
-        await telegram_app.stop()
-        await telegram_app.shutdown()
-        log.info("🛑 Telegram bot stopped.")
+    await application.stop()
+    await application.shutdown()
+    logger.info("🛑 Bot stopped cleanly.")
+
+# ------------------------------------------------
+#                 ENTRYPOINT
+# ------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    logger.info("🚀 Starting Rizo Battle Bot (FastAPI + Telegram)")
+    uvicorn.run("bot:fastapi_app", host="0.0.0.0", port=PORT)
