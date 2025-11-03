@@ -212,7 +212,7 @@ def simulate_battle(card1: dict, card2: dict):
 def save_battle_html(battle_id: str, context: dict):
     os.makedirs("battles", exist_ok=True)
     html_path = f"battles/{battle_id}.html"
-    image_src = "/static/battle_placeholder.mp4"
+    image_src = "/static/battle_placeholder1.mp4"
     battle_html = f"""
     <!DOCTYPE html>
     <html>
