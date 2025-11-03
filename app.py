@@ -373,13 +373,15 @@ telegram_app: Optional[Application] = None
 @app.on_event("startup")
 async def on_startup():
     global telegram_app
-    log.info("Starting Telegram Application...")
+    log.info("Starting Telegram bot...")
     telegram_app = Application.builder().token(BOT_TOKEN).build()
     telegram_app.add_handler(CommandHandler("battle", cmd_battle))
     telegram_app.add_handler(CommandHandler("challenge", cmd_challenge))
     telegram_app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handler_card_upload))
 
+    # Start the bot
     await telegram_app.initialize()
+    await telegram_app.start()
     await telegram_app.bot.delete_webhook(drop_pending_updates=True)
     await telegram_app.bot.set_webhook(WEBHOOK_URL)
     log.info("Webhook set to %s", WEBHOOK_URL)
