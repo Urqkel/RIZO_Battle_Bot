@@ -351,6 +351,27 @@ async def handler_card_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         await update.message.reply_text("Card received. Waiting for opponent to upload theirs.")
 
+# ---------- Telegram webhook ----------
+from fastapi import Request
+
+@app.post(WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    """Receive incoming Telegram updates."""
+    global telegram_app
+    if not telegram_app:
+        log.warning("Telegram app not initialized yet.")
+        return JSONResponse({"ok": False, "error": "Bot not initialized"})
+
+    try:
+        data = await request.json()
+        update = Update.de_json(data, telegram_app.bot)
+        log.info("Incoming update: %s", data.get("message", {}).get("text", "non-text update"))
+        await telegram_app.process_update(update)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        log.exception("Error handling update: %s", e)
+        return JSONResponse({"ok": False, "error": str(e)})
+
 
 # ---------- FastAPI routes ----------
 @app.get("/")
