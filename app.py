@@ -292,11 +292,11 @@ async def battle_page(battle_id: str):
 async def telegram_webhook(req: Request):
     data = await req.json()
     update = Update.de_json(data, telegram_app.bot)
-    await telegram_app.update_queue.put(update)
+    await telegram_app.process_update(update)
     return {"ok": True}
 
 # ---------- Telegram app startup ----------
-telegram_app: Optional[ApplicationBuilder] = None
+telegram_app: Optional[Application] = None
 
 @app.on_event("startup")
 async def on_startup():
