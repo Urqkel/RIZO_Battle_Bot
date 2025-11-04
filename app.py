@@ -309,7 +309,6 @@ async def on_startup():
     telegram_app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handler_card_upload))
 
     await telegram_app.initialize()
-    await telegram_app.start()
     await telegram_app.bot.delete_webhook(drop_pending_updates=True)
     await telegram_app.bot.set_webhook(WEBHOOK_URL)
     log.info(f"✅ Webhook set to {WEBHOOK_URL}")
