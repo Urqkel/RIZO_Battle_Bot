@@ -432,7 +432,7 @@ async def on_startup():
     telegram_app.add_handler(CommandHandler("battle", cmd_battle))
     telegram_app.add_handler(CommandHandler("challenge", cmd_challenge))
     # Filter for photos and image documents
-    telegram_app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGES, handler_card_upload))
+    telegram_app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handler_card_upload))
 
     await telegram_app.initialize()
     
