@@ -1,14 +1,13 @@
 FROM python:3.11-slim
 
 # ---------- Environment setup ----------
-# Ensure output is streamed immediately and Python doesn't write .pyc files
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
 # ---------- Install system dependencies for Pillow, tesseract, and utility programs ----------
+# Removed 'build-essential' as it is often not needed on slim for runtime, but kept Tesseract dependencies.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        build-essential \
         libglib2.0-0 \
         libsm6 \
         libxrender1 \
@@ -16,7 +15,6 @@ RUN apt-get update && \
         tesseract-ocr \
         tesseract-ocr-eng \
         poppler-utils \
-        git \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -34,13 +32,13 @@ RUN pip install --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ---------- Expose port ----------
-# Render will look for the PORT env variable, but we expose 10000 as a default.
 EXPOSE 10000
 
 # ---------- Set environment variables (Placeholder) ----------
 ENV BOT_TOKEN=""
 ENV RENDER_EXTERNAL_URL=""
 
-# ---------- Start the bot with Uvicorn, binding to 0.0.0.0 and the $PORT environment variable ----------
-# This ensures Uvicorn listens on the port specified by the hosting environment (e.g., Render)
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "${PORT:-10000}"]
+# ---------- Start the bot (Shell form CMD used for variable substitution) ----------
+# We use the shell form CMD to ensure the environment variable $PORT is correctly
+# substituted into the command before Uvicorn runs.
+CMD uvicorn app:app --host 0.0.0.0 --port $PORT
